@@ -40,9 +40,8 @@ def prep_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["seconds_elapsed", "longitude", "latitude"]).sort_values("seconds_elapsed")
     df = df.reset_index(drop=True)
 
-    # Optional bearing fallback: compute from heading between consecutive points if bearing missing
+    # If bearing missing, approximate bearing from previous->current point
     if "bearing" not in df.columns or df["bearing"].isna().mean() > 0.8:
-        # approximate bearing (deg) from prev->curr
         lat1 = np.radians(df["latitude"].shift(1))
         lat2 = np.radians(df["latitude"])
         dlon = np.radians(df["longitude"] - df["longitude"].shift(1))
@@ -53,12 +52,12 @@ def prep_df(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-st.title("🗺️ Smooth Live Movement Map (Google-Maps feel)")
+st.title("🗺️ Smooth Live Movement (Google-Maps feel, no flashing)")
 
 with st.sidebar:
     st.subheader("Data Source")
     uploaded = st.file_uploader("Upload CSV/TSV", type=["csv", "tsv"])
-    sheet_url = st.text_input("Google Sheet CSV export link")
+    sheet_url = st.text_input("Google Sheet CSV export link", placeholder="https://docs.google.com/spreadsheets/d/<ID>/export?format=csv&gid=0")
 
 try:
     raw = load_df(uploaded, sheet_url)
@@ -72,27 +71,23 @@ if len(df) < 2:
     st.dataframe(df)
     st.stop()
 
-# Prepare arrays for JS: coords as [lon, lat], times as seconds_elapsed
 coords = df[["longitude", "latitude"]].astype(float).values.tolist()
 times = df["seconds_elapsed"].astype(float).values.tolist()
 bearings = df["bearing"].astype(float).values.tolist()
-
-# Map center
-center_lon = float(df["longitude"].iloc[0])
-center_lat = float(df["latitude"].iloc[0])
 
 payload = {
     "coords": coords,
     "times": times,
     "bearings": bearings,
-    "center": [center_lon, center_lat],
+    "center": [float(coords[0][0]), float(coords[0][1])],
     "tMin": float(min(times)),
     "tMax": float(max(times)),
 }
 
-# HTML/JS: MapLibre GL + smooth animation in browser (no Streamlit reruns)
-# Uses free OSM style via demotiles. Works best when outbound internet is allowed.
-html = f"""
+payload_json = json.dumps(payload)
+
+# IMPORTANT: not an f-string, so JS `${...}` is safe
+html = """
 <!doctype html>
 <html>
 <head>
@@ -101,24 +96,25 @@ html = f"""
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
   <style>
-    html, body {{ margin:0; padding:0; height:100%; width:100%; background:#fff; }}
-    #map {{ position:absolute; top:0; bottom:0; width:100%; }}
-    .panel {{
+    html, body { margin:0; padding:0; height:100%; width:100%; background:#fff; }
+    #map { position:absolute; top:0; bottom:0; width:100%; }
+
+    .panel {
       position:absolute; top:12px; left:12px; z-index:10;
-      background: rgba(255,255,255,0.95); border:1px solid #ddd;
+      background: rgba(255,255,255,0.96); border:1px solid #ddd;
       border-radius:12px; padding:10px 12px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 6px 22px rgba(0,0,0,0.12);
-      width: 320px;
-    }}
-    .row {{ display:flex; align-items:center; gap:10px; margin-top:8px; }}
-    .btn {{
+      width: 330px;
+    }
+    .row { display:flex; align-items:center; gap:10px; margin-top:8px; }
+    .btn {
       padding:6px 10px; border-radius:10px; border:1px solid #ccc; background:#fff;
       cursor:pointer; user-select:none;
-    }}
-    .btn:active {{ transform: translateY(1px); }}
-    input[type="range"] {{ width: 100%; }}
-    .small {{ font-size: 12px; color:#333; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+    }
+    .btn:active { transform: translateY(1px); }
+    input[type="range"] { width: 100%; }
+    .small { font-size: 12px; color:#333; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
   </style>
 </head>
 <body>
@@ -126,7 +122,10 @@ html = f"""
 
   <div class="panel">
     <div class="row" style="justify-content:space-between;">
-      <div><b>Smooth Playback</b><div class="small">No flashing • Browser-side animation</div></div>
+      <div>
+        <b>Smooth Playback</b>
+        <div class="small">Browser-side animation • no Streamlit reruns</div>
+      </div>
       <div class="btn" id="btnPlay">▶ Play</div>
       <div class="btn" id="btnPause">⏸ Pause</div>
     </div>
@@ -149,53 +148,50 @@ html = f"""
   </div>
 
 <script>
-  const DATA = {json.dumps(payload)};
+  const DATA = __PAYLOAD_JSON__;
+
   const coords = DATA.coords;     // [ [lon,lat], ... ]
   const times  = DATA.times;      // seconds_elapsed
   const bears  = DATA.bearings;   // bearing per point
 
-  // Simple linear interpolation between two points based on time
-  function lerp(a,b,t) {{ return a + (b-a)*t; }}
+  function lerp(a,b,t) { return a + (b-a)*t; }
 
-  function findSegmentIndex(t) {{
-    // returns i such that times[i] <= t <= times[i+1]
+  function findSegmentIndex(t) {
     if (t <= times[0]) return 0;
     if (t >= times[times.length-1]) return times.length-2;
-    // binary search
+
     let lo = 0, hi = times.length - 1;
-    while (hi - lo > 1) {{
+    while (hi - lo > 1) {
       const mid = (lo + hi) >> 1;
       if (times[mid] <= t) lo = mid; else hi = mid;
-    }}
+    }
     return lo;
-  }}
+  }
 
-  function interpState(t) {{
+  function interpState(t) {
     const i = findSegmentIndex(t);
     const t0 = times[i], t1 = times[i+1];
     const p0 = coords[i], p1 = coords[i+1];
-    const b0 = bears[i] ?? 0, b1 = bears[i+1] ?? b0;
+    const b0 = (bears[i] ?? 0), b1 = (bears[i+1] ?? b0);
 
     const u = (t1 === t0) ? 0 : (t - t0) / (t1 - t0);
     const lon = lerp(p0[0], p1[0], u);
     const lat = lerp(p0[1], p1[1], u);
 
-    // Bearing interpolation with wrap
     let db = ((b1 - b0 + 540) % 360) - 180;
     const bearing = (b0 + db * u + 360) % 360;
 
-    return {{ lon, lat, bearing, i, u }};
-  }}
+    return { lon, lat, bearing, i, u };
+  }
 
-  // MapLibre map
-  const map = new maplibregl.Map({{
+  const map = new maplibregl.Map({
     container: "map",
     style: "https://demotiles.maplibre.org/style.json",
     center: DATA.center,
     zoom: 17,
     pitch: 45,
     bearing: 0
-  }});
+  });
   map.addControl(new maplibregl.NavigationControl(), "top-right");
 
   // Marker element (arrow)
@@ -207,36 +203,29 @@ html = f"""
   el.style.borderRadius = "6px";
   el.style.boxShadow = "0 6px 18px rgba(0,0,0,0.25)";
   el.style.transformOrigin = "center";
-  // Make it look like an arrow-ish by adding a pseudo triangle via clip-path
   el.style.clipPath = "polygon(50% 0%, 100% 60%, 50% 45%, 0% 60%)";
 
-  const marker = new maplibregl.Marker({{ element: el }})
+  const marker = new maplibregl.Marker({ element: el })
     .setLngLat(coords[0])
     .addTo(map);
 
-  // Route line geojson
-  const lineGeo = {{
+  // Route line
+  const lineGeo = {
     type: "Feature",
-    geometry: {{
-      type: "LineString",
-      coordinates: coords
-    }}
-  }};
+    geometry: { type: "LineString", coordinates: coords }
+  };
 
-  map.on("load", () => {{
-    map.addSource("route", {{ type: "geojson", data: lineGeo }});
-    map.addLayer({{
+  map.on("load", () => {
+    map.addSource("route", { type: "geojson", data: lineGeo });
+    map.addLayer({
       id: "route-line",
       type: "line",
       source: "route",
-      paint: {{
-        "line-width": 6,
-        "line-opacity": 0.7
-      }}
-    }});
-  }});
+      paint: { "line-width": 6, "line-opacity": 0.7 }
+    });
+  });
 
-  // UI elements
+  // UI
   const btnPlay = document.getElementById("btnPlay");
   const btnPause = document.getElementById("btnPause");
   const speedEl = document.getElementById("speed");
@@ -248,83 +237,81 @@ html = f"""
   const tMin = DATA.tMin;
   const tMax = DATA.tMax;
 
-  // scrub maps 0..1000 -> tMin..tMax
-  function scrubToT(s) {{
+  function scrubToT(s) {
     const u = s / 1000.0;
     return tMin + (tMax - tMin) * u;
-  }}
-  function tToScrub(t) {{
+  }
+  function tToScrub(t) {
     const u = (t - tMin) / (tMax - tMin);
     return Math.max(0, Math.min(1000, Math.round(u * 1000)));
-  }}
+  }
 
   let playing = false;
   let speed = parseFloat(speedEl.value);
   let t = tMin;
   let lastTs = null;
 
-  function updateUI(state) {{
+  function updateUI(state) {
     timeVal.textContent = `t=${t.toFixed(2)}s`;
     posVal.textContent = `lat=${state.lat.toFixed(6)} lon=${state.lon.toFixed(6)}`;
     speedVal.textContent = `${speed.toFixed(2)}x`;
-  }}
+  }
 
-  function tick(ts) {{
+  function tick(ts) {
     if (!playing) return;
     if (lastTs === null) lastTs = ts;
     const dtMs = ts - lastTs;
     lastTs = ts;
 
-    // advance time by dt in seconds * speed
     t += (dtMs / 1000.0) * speed;
-    if (t >= tMax) {{
+    if (t >= tMax) {
       t = tMax;
       playing = false;
-    }}
+    }
 
     const state = interpState(t);
     marker.setLngLat([state.lon, state.lat]);
     el.style.transform = `rotate(${state.bearing}deg)`;
 
-    // Optional: keep camera following
-    map.easeTo({{
+    // Smooth camera follow
+    map.easeTo({
       center: [state.lon, state.lat],
       duration: 200,
       easing: (x) => x
-    }});
+    });
 
     scrub.value = tToScrub(t);
     updateUI(state);
 
     requestAnimationFrame(tick);
-  }}
+  }
 
-  btnPlay.onclick = () => {{
-    if (!playing) {{
+  btnPlay.onclick = () => {
+    if (!playing) {
       playing = true;
       lastTs = null;
       requestAnimationFrame(tick);
-    }}
-  }};
-  btnPause.onclick = () => {{
-    playing = false;
-  }};
+    }
+  };
 
-  speedEl.oninput = () => {{
+  btnPause.onclick = () => {
+    playing = false;
+  };
+
+  speedEl.oninput = () => {
     speed = parseFloat(speedEl.value);
     speedVal.textContent = `${speed.toFixed(2)}x`;
-  }};
+  };
 
-  scrub.oninput = () => {{
-    // scrubbing pauses playback (like Google Maps)
-    playing = false;
+  scrub.oninput = () => {
+    playing = false; // like Google Maps scrubbing
     t = scrubToT(parseInt(scrub.value, 10));
     const state = interpState(t);
     marker.setLngLat([state.lon, state.lat]);
     el.style.transform = `rotate(${state.bearing}deg)`;
-    map.jumpTo({{ center: [state.lon, state.lat] }});
+    map.jumpTo({ center: [state.lon, state.lat] });
     updateUI(state);
-  }};
+  };
 
   // Initial render
   const s0 = interpState(t);
@@ -334,9 +321,10 @@ html = f"""
 </html>
 """
 
-# Big map
-components.html(html, height=720)
+# Inject payload JSON safely
+html = html.replace("__PAYLOAD_JSON__", payload_json)
 
-# Small data preview (optional)
-with st.expander("Show data preview"):
+components.html(html, height=740)
+
+with st.expander("Data preview"):
     st.dataframe(df.head(50), use_container_width=True)
