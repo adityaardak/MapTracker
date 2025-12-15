@@ -1,13 +1,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import folium
-import streamlit.components.v1 as components
-from folium.plugins import TimestampedGeoJson
+import json
 from io import StringIO
-from datetime import datetime, timezone, timedelta
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Smooth GPS Playback", layout="wide")
+st.set_page_config(page_title="Smooth GPS Playback (MapLibre)", layout="wide")
 
 SAMPLE_TSV = """time\tseconds_elapsed\tbearingAccuracy\tspeedAccuracy\tverticalAccuracy\thorizontalAccuracy\tspeed\tbearing\taltitude\tlongitude\tlatitude
 1.74296E+18\t0.255999756\t45\t1.5\t1.307455301\t20.59600067\t0\t0\t374.8000183\t78.5795227\t21.2710244
@@ -16,204 +14,329 @@ SAMPLE_TSV = """time\tseconds_elapsed\tbearingAccuracy\tspeedAccuracy\tverticalA
 1.74296E+18\t4.241882813\t89.88391113\t0.781779766\t1.347314119\t8.765999794\t0.213110328\t88.08830261\t374.8000183\t78.5796205\t21.2710833
 """
 
-# ------------------------- Helpers -------------------------
-def load_data(uploaded, sheet_url: str | None) -> pd.DataFrame:
+def load_df(uploaded, sheet_url: str | None) -> pd.DataFrame:
     if uploaded is not None:
         name = uploaded.name.lower()
         if name.endswith(".tsv"):
             return pd.read_csv(uploaded, sep="\t")
         return pd.read_csv(uploaded)
-
     if sheet_url and sheet_url.strip():
         return pd.read_csv(sheet_url.strip())
-
     return pd.read_csv(StringIO(SAMPLE_TSV), sep="\t")
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    """Vectorized haversine distance in meters."""
-    R = 6371000.0
-    lat1 = np.radians(lat1)
-    lon1 = np.radians(lon1)
-    lat2 = np.radians(lat2)
-    lon2 = np.radians(lon2)
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat/2.0)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2.0)**2
-    return 2 * R * np.arcsin(np.sqrt(a))
-
-def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
+def prep_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
-    required = ["seconds_elapsed", "latitude", "longitude"]
+    required = ["seconds_elapsed", "longitude", "latitude"]
     for c in required:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
 
-    # numeric
-    for c in ["seconds_elapsed", "latitude", "longitude", "speed", "bearing"]:
+    for c in ["seconds_elapsed", "longitude", "latitude", "bearing", "speed"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=["seconds_elapsed", "latitude", "longitude"]).sort_values("seconds_elapsed")
+    df = df.dropna(subset=["seconds_elapsed", "longitude", "latitude"]).sort_values("seconds_elapsed")
     df = df.reset_index(drop=True)
 
-    # Engineering
-    df["lat_prev"] = df["latitude"].shift(1)
-    df["lon_prev"] = df["longitude"].shift(1)
-    df["dt"] = df["seconds_elapsed"].diff()
-
-    df["dist_m"] = haversine_m(df["lat_prev"], df["lon_prev"], df["latitude"], df["longitude"]).fillna(0)
-
-    # If speed missing or mostly NaN, derive from GPS
-    if "speed" not in df.columns or df["speed"].isna().mean() > 0.5:
-        df["speed"] = (df["dist_m"] / df["dt"]).replace([np.inf, -np.inf], np.nan)
-
-    df["accel_mps2"] = (df["speed"] - df["speed"].shift(1)) / df["dt"]
-    df["is_stop"] = df["speed"].fillna(0) < 0.5
-
-    # Simple anomaly: huge jumps in step distance
-    mu = df["dist_m"].mean()
-    sd = df["dist_m"].std(ddof=0)
-    thr = mu + 3 * (sd if sd > 0 else 1.0)
-    df["anomaly"] = df["dist_m"] > thr
+    # Optional bearing fallback: compute from heading between consecutive points if bearing missing
+    if "bearing" not in df.columns or df["bearing"].isna().mean() > 0.8:
+        # approximate bearing (deg) from prev->curr
+        lat1 = np.radians(df["latitude"].shift(1))
+        lat2 = np.radians(df["latitude"])
+        dlon = np.radians(df["longitude"] - df["longitude"].shift(1))
+        y = np.sin(dlon) * np.cos(lat2)
+        x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
+        brng = (np.degrees(np.arctan2(y, x)) + 360) % 360
+        df["bearing"] = brng.fillna(0)
 
     return df
 
-def build_timeline_map(df: pd.DataFrame, period_s: float, transition_ms: int, show_anoms: bool):
-    # Center
-    center = [float(df.loc[0, "latitude"]), float(df.loc[0, "longitude"])]
-
-    # Use a stable tile provider
-    m = folium.Map(location=center, zoom_start=18, tiles="CartoDB positron", control_scale=True)
-
-    # Background route polyline
-    route_latlon = df[["latitude", "longitude"]].astype(float).values.tolist()
-    if len(route_latlon) >= 2:
-        folium.PolyLine(route_latlon, weight=6, opacity=0.35).add_to(m)
-
-    # Optional anomaly markers (static)
-    if show_anoms:
-        anoms = df[df["anomaly"]]
-        for _, r in anoms.iterrows():
-            folium.CircleMarker(
-                location=[float(r["latitude"]), float(r["longitude"])],
-                radius=4,
-                color="red",
-                fill=True,
-                fill_opacity=0.85,
-                popup=f"Anomaly | t={r['seconds_elapsed']:.2f}s | dist={r['dist_m']:.2f}m"
-            ).add_to(m)
-
-    # Timeline timestamps (ISO8601)
-    base = datetime.now(timezone.utc).replace(microsecond=0)
-    times = [(base + timedelta(seconds=float(s))).isoformat() for s in df["seconds_elapsed"].astype(float).values]
-
-    # IMPORTANT: GeoJSON LineString wants coords [lon, lat]
-    coords_lonlat = df[["longitude", "latitude"]].astype(float).values.tolist()
-
-    # One LineString feature + times list => smooth moving locator
-    feature = {
-        "type": "Feature",
-        "geometry": {"type": "LineString", "coordinates": coords_lonlat},
-        "properties": {
-            "times": times,  # must match length of coordinates
-            "style": {"color": "#e11d48", "weight": 6, "opacity": 0.9},
-        },
-    }
-
-    TimestampedGeoJson(
-        {"type": "FeatureCollection", "features": [feature]},
-        period=f"PT{max(period_s, 0.05)}S",
-        add_last_point=True,           # shows the moving locator
-        auto_play=False,               # user clicks ▶ (reliable across browsers)
-        loop=False,
-        max_speed=12,
-        loop_button=True,
-        time_slider_drag_update=True,
-        transition_time=int(transition_ms),
-        date_options="HH:mm:ss",
-    ).add_to(m)
-
-    # On-map hint
-    folium.Marker(
-        center,
-        icon=folium.DivIcon(
-            html="<div style='font-size:12px;color:#111;background:#fff;padding:6px 8px;border-radius:8px;border:1px solid #ddd;'>Click ▶ (bottom-left) to play</div>"
-        )
-    ).add_to(m)
-
-    return m
-
-# ------------------------- UI -------------------------
-st.title("🗺️ Smooth GPS Playback (No flashing) + Analytics")
+st.title("🗺️ Smooth Live Movement Map (Google-Maps feel)")
 
 with st.sidebar:
     st.subheader("Data Source")
-    uploaded = st.file_uploader("Upload CSV / TSV", type=["csv", "tsv"])
-    sheet_url = st.text_input("Google Sheet CSV export link", placeholder="https://docs.google.com/spreadsheets/d/<ID>/export?format=csv&gid=0")
-
-    st.subheader("Playback Settings")
-    period_s = st.slider("Frame period (seconds)", 0.05, 2.0, 0.20, 0.05)
-    transition_ms = st.slider("Transition smoothness (ms)", 0, 1500, 450, 50)
-    show_anoms = st.checkbox("Show anomaly points", value=True)
+    uploaded = st.file_uploader("Upload CSV/TSV", type=["csv", "tsv"])
+    sheet_url = st.text_input("Google Sheet CSV export link")
 
 try:
-    raw = load_data(uploaded, sheet_url)
-    df = prepare_df(raw)
+    raw = load_df(uploaded, sheet_url)
+    df = prep_df(raw)
 except Exception as e:
     st.error(f"Data error: {e}")
     st.stop()
 
-if df.empty or len(df) < 2:
-    st.warning("Need at least 2 valid rows (latitude, longitude, seconds_elapsed) to animate.")
+if len(df) < 2:
+    st.warning("Need at least 2 points to animate.")
     st.dataframe(df)
     st.stop()
 
-# KPIs
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Rows", f"{len(df)}")
-k2.metric("Total Distance", f"{df['dist_m'].sum()/1000:.3f} km")
-k3.metric("Avg Speed", f"{df['speed'].mean():.3f} m/s")
-k4.metric("Stops", f"{df['is_stop'].mean()*100:.1f}%")
-k5.metric("Anomalies", f"{int(df['anomaly'].sum())}")
+# Prepare arrays for JS: coords as [lon, lat], times as seconds_elapsed
+coords = df[["longitude", "latitude"]].astype(float).values.tolist()
+times = df["seconds_elapsed"].astype(float).values.tolist()
+bearings = df["bearing"].astype(float).values.tolist()
 
-left, right = st.columns([2, 1], gap="large")
+# Map center
+center_lon = float(df["longitude"].iloc[0])
+center_lat = float(df["latitude"].iloc[0])
 
-with left:
-    st.subheader("✅ Map + Smooth Locator (bottom-left ▶ controls)")
-    m = build_timeline_map(df, period_s=period_s, transition_ms=transition_ms, show_anoms=show_anoms)
-    # Render folium reliably
-    components.html(m._repr_html_(), height=700)
+payload = {
+    "coords": coords,
+    "times": times,
+    "bearings": bearings,
+    "center": [center_lon, center_lat],
+    "tMin": float(min(times)),
+    "tMax": float(max(times)),
+}
 
-with right:
-    st.subheader("📊 Analytics (No Plotly)")
+# HTML/JS: MapLibre GL + smooth animation in browser (no Streamlit reruns)
+# Uses free OSM style via demotiles. Works best when outbound internet is allowed.
+html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    html, body {{ margin:0; padding:0; height:100%; width:100%; background:#fff; }}
+    #map {{ position:absolute; top:0; bottom:0; width:100%; }}
+    .panel {{
+      position:absolute; top:12px; left:12px; z-index:10;
+      background: rgba(255,255,255,0.95); border:1px solid #ddd;
+      border-radius:12px; padding:10px 12px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      box-shadow: 0 6px 22px rgba(0,0,0,0.12);
+      width: 320px;
+    }}
+    .row {{ display:flex; align-items:center; gap:10px; margin-top:8px; }}
+    .btn {{
+      padding:6px 10px; border-radius:10px; border:1px solid #ccc; background:#fff;
+      cursor:pointer; user-select:none;
+    }}
+    .btn:active {{ transform: translateY(1px); }}
+    input[type="range"] {{ width: 100%; }}
+    .small {{ font-size: 12px; color:#333; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
 
-    st.write("Speed vs Time")
-    if "speed" in df.columns:
-        st.line_chart(df.set_index("seconds_elapsed")["speed"], height=220)
+  <div class="panel">
+    <div class="row" style="justify-content:space-between;">
+      <div><b>Smooth Playback</b><div class="small">No flashing • Browser-side animation</div></div>
+      <div class="btn" id="btnPlay">▶ Play</div>
+      <div class="btn" id="btnPause">⏸ Pause</div>
+    </div>
 
-    st.write("Step Distance (m)")
-    st.bar_chart(df["dist_m"], height=220)
+    <div class="row">
+      <div class="small" style="width:72px;">Speed</div>
+      <input id="speed" type="range" min="0.25" max="8" value="1" step="0.25" />
+      <div class="small mono" id="speedVal">1.00x</div>
+    </div>
 
-    st.write("Acceleration vs Time")
-    if "accel_mps2" in df.columns:
-        accel_series = df.set_index("seconds_elapsed")["accel_mps2"].replace([np.inf, -np.inf], np.nan).fillna(0)
-        st.line_chart(accel_series, height=220)
+    <div class="row">
+      <div class="small" style="width:72px;">Scrub</div>
+      <input id="scrub" type="range" min="0" max="1000" value="0" step="1" />
+    </div>
 
-    st.write("Anomaly Points (table)")
-    st.dataframe(
-        df[df["anomaly"]][["seconds_elapsed", "dist_m", "speed", "latitude", "longitude"]].head(50),
-        use_container_width=True
-    )
+    <div class="row" style="justify-content:space-between;">
+      <div class="small mono" id="timeVal"></div>
+      <div class="small mono" id="posVal"></div>
+    </div>
+  </div>
 
-    st.download_button(
-        "⬇ Download enriched CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name="gps_enriched.csv",
-        mime="text/csv"
-    )
+<script>
+  const DATA = {json.dumps(payload)};
+  const coords = DATA.coords;     // [ [lon,lat], ... ]
+  const times  = DATA.times;      // seconds_elapsed
+  const bears  = DATA.bearings;   // bearing per point
 
-st.divider()
-st.subheader("Preview Data")
-st.dataframe(df.head(50), use_container_width=True)
+  // Simple linear interpolation between two points based on time
+  function lerp(a,b,t) {{ return a + (b-a)*t; }}
+
+  function findSegmentIndex(t) {{
+    // returns i such that times[i] <= t <= times[i+1]
+    if (t <= times[0]) return 0;
+    if (t >= times[times.length-1]) return times.length-2;
+    // binary search
+    let lo = 0, hi = times.length - 1;
+    while (hi - lo > 1) {{
+      const mid = (lo + hi) >> 1;
+      if (times[mid] <= t) lo = mid; else hi = mid;
+    }}
+    return lo;
+  }}
+
+  function interpState(t) {{
+    const i = findSegmentIndex(t);
+    const t0 = times[i], t1 = times[i+1];
+    const p0 = coords[i], p1 = coords[i+1];
+    const b0 = bears[i] ?? 0, b1 = bears[i+1] ?? b0;
+
+    const u = (t1 === t0) ? 0 : (t - t0) / (t1 - t0);
+    const lon = lerp(p0[0], p1[0], u);
+    const lat = lerp(p0[1], p1[1], u);
+
+    // Bearing interpolation with wrap
+    let db = ((b1 - b0 + 540) % 360) - 180;
+    const bearing = (b0 + db * u + 360) % 360;
+
+    return {{ lon, lat, bearing, i, u }};
+  }}
+
+  // MapLibre map
+  const map = new maplibregl.Map({{
+    container: "map",
+    style: "https://demotiles.maplibre.org/style.json",
+    center: DATA.center,
+    zoom: 17,
+    pitch: 45,
+    bearing: 0
+  }});
+  map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  // Marker element (arrow)
+  const el = document.createElement("div");
+  el.style.width = "18px";
+  el.style.height = "18px";
+  el.style.background = "#e11d48";
+  el.style.border = "2px solid white";
+  el.style.borderRadius = "6px";
+  el.style.boxShadow = "0 6px 18px rgba(0,0,0,0.25)";
+  el.style.transformOrigin = "center";
+  // Make it look like an arrow-ish by adding a pseudo triangle via clip-path
+  el.style.clipPath = "polygon(50% 0%, 100% 60%, 50% 45%, 0% 60%)";
+
+  const marker = new maplibregl.Marker({{ element: el }})
+    .setLngLat(coords[0])
+    .addTo(map);
+
+  // Route line geojson
+  const lineGeo = {{
+    type: "Feature",
+    geometry: {{
+      type: "LineString",
+      coordinates: coords
+    }}
+  }};
+
+  map.on("load", () => {{
+    map.addSource("route", {{ type: "geojson", data: lineGeo }});
+    map.addLayer({{
+      id: "route-line",
+      type: "line",
+      source: "route",
+      paint: {{
+        "line-width": 6,
+        "line-opacity": 0.7
+      }}
+    }});
+  }});
+
+  // UI elements
+  const btnPlay = document.getElementById("btnPlay");
+  const btnPause = document.getElementById("btnPause");
+  const speedEl = document.getElementById("speed");
+  const speedVal = document.getElementById("speedVal");
+  const scrub = document.getElementById("scrub");
+  const timeVal = document.getElementById("timeVal");
+  const posVal = document.getElementById("posVal");
+
+  const tMin = DATA.tMin;
+  const tMax = DATA.tMax;
+
+  // scrub maps 0..1000 -> tMin..tMax
+  function scrubToT(s) {{
+    const u = s / 1000.0;
+    return tMin + (tMax - tMin) * u;
+  }}
+  function tToScrub(t) {{
+    const u = (t - tMin) / (tMax - tMin);
+    return Math.max(0, Math.min(1000, Math.round(u * 1000)));
+  }}
+
+  let playing = false;
+  let speed = parseFloat(speedEl.value);
+  let t = tMin;
+  let lastTs = null;
+
+  function updateUI(state) {{
+    timeVal.textContent = `t=${t.toFixed(2)}s`;
+    posVal.textContent = `lat=${state.lat.toFixed(6)} lon=${state.lon.toFixed(6)}`;
+    speedVal.textContent = `${speed.toFixed(2)}x`;
+  }}
+
+  function tick(ts) {{
+    if (!playing) return;
+    if (lastTs === null) lastTs = ts;
+    const dtMs = ts - lastTs;
+    lastTs = ts;
+
+    // advance time by dt in seconds * speed
+    t += (dtMs / 1000.0) * speed;
+    if (t >= tMax) {{
+      t = tMax;
+      playing = false;
+    }}
+
+    const state = interpState(t);
+    marker.setLngLat([state.lon, state.lat]);
+    el.style.transform = `rotate(${state.bearing}deg)`;
+
+    // Optional: keep camera following
+    map.easeTo({{
+      center: [state.lon, state.lat],
+      duration: 200,
+      easing: (x) => x
+    }});
+
+    scrub.value = tToScrub(t);
+    updateUI(state);
+
+    requestAnimationFrame(tick);
+  }}
+
+  btnPlay.onclick = () => {{
+    if (!playing) {{
+      playing = true;
+      lastTs = null;
+      requestAnimationFrame(tick);
+    }}
+  }};
+  btnPause.onclick = () => {{
+    playing = false;
+  }};
+
+  speedEl.oninput = () => {{
+    speed = parseFloat(speedEl.value);
+    speedVal.textContent = `${speed.toFixed(2)}x`;
+  }};
+
+  scrub.oninput = () => {{
+    // scrubbing pauses playback (like Google Maps)
+    playing = false;
+    t = scrubToT(parseInt(scrub.value, 10));
+    const state = interpState(t);
+    marker.setLngLat([state.lon, state.lat]);
+    el.style.transform = `rotate(${state.bearing}deg)`;
+    map.jumpTo({{ center: [state.lon, state.lat] }});
+    updateUI(state);
+  }};
+
+  // Initial render
+  const s0 = interpState(t);
+  updateUI(s0);
+</script>
+</body>
+</html>
+"""
+
+# Big map
+components.html(html, height=720)
+
+# Small data preview (optional)
+with st.expander("Show data preview"):
+    st.dataframe(df.head(50), use_container_width=True)
