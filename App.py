@@ -5,7 +5,7 @@ import json
 from io import StringIO
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Smooth GPS Playback (MapLibre)", layout="wide")
+st.set_page_config(page_title="Smooth GPS Playback (OSM)", layout="wide")
 
 SAMPLE_TSV = """time\tseconds_elapsed\tbearingAccuracy\tspeedAccuracy\tverticalAccuracy\thorizontalAccuracy\tspeed\tbearing\taltitude\tlongitude\tlatitude
 1.74296E+18\t0.255999756\t45\t1.5\t1.307455301\t20.59600067\t0\t0\t374.8000183\t78.5795227\t21.2710244
@@ -40,7 +40,7 @@ def prep_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["seconds_elapsed", "longitude", "latitude"]).sort_values("seconds_elapsed")
     df = df.reset_index(drop=True)
 
-    # If bearing missing, approximate bearing from previous->current point
+    # Bearing fallback if missing
     if "bearing" not in df.columns or df["bearing"].isna().mean() > 0.8:
         lat1 = np.radians(df["latitude"].shift(1))
         lat2 = np.radians(df["latitude"])
@@ -52,16 +52,15 @@ def prep_df(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-st.title("🗺️ Smooth Live Movement (Google-Maps feel, no flashing)")
+st.title("🗺️ Smooth GPS Playback (Roads visible + no flashing)")
 
 with st.sidebar:
     st.subheader("Data Source")
     uploaded = st.file_uploader("Upload CSV/TSV", type=["csv", "tsv"])
-    sheet_url = st.text_input("Google Sheet CSV export link", placeholder="https://docs.google.com/spreadsheets/d/<ID>/export?format=csv&gid=0")
+    sheet_url = st.text_input("Google Sheet CSV export link")
 
 try:
-    raw = load_df(uploaded, sheet_url)
-    df = prep_df(raw)
+    df = prep_df(load_df(uploaded, sheet_url))
 except Exception as e:
     st.error(f"Data error: {e}")
     st.stop()
@@ -83,10 +82,9 @@ payload = {
     "tMin": float(min(times)),
     "tMax": float(max(times)),
 }
-
 payload_json = json.dumps(payload)
 
-# IMPORTANT: not an f-string, so JS `${...}` is safe
+# IMPORTANT: plain triple-quote (NOT f-string)
 html = """
 <!doctype html>
 <html>
@@ -102,9 +100,10 @@ html = """
     .panel {
       position:absolute; top:12px; left:12px; z-index:10;
       background: rgba(255,255,255,0.96); border:1px solid #ddd;
-      border-radius:12px; padding:10px 12px; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      border-radius:12px; padding:10px 12px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
       box-shadow: 0 6px 22px rgba(0,0,0,0.12);
-      width: 330px;
+      width: 360px;
     }
     .row { display:flex; align-items:center; gap:10px; margin-top:8px; }
     .btn {
@@ -115,6 +114,7 @@ html = """
     input[type="range"] { width: 100%; }
     .small { font-size: 12px; color:#333; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .toggle { display:flex; align-items:center; gap:8px; margin-top:8px; }
   </style>
 </head>
 <body>
@@ -124,7 +124,7 @@ html = """
     <div class="row" style="justify-content:space-between;">
       <div>
         <b>Smooth Playback</b>
-        <div class="small">Browser-side animation • no Streamlit reruns</div>
+        <div class="small">OSM roads/labels • browser-side animation</div>
       </div>
       <div class="btn" id="btnPlay">▶ Play</div>
       <div class="btn" id="btnPause">⏸ Pause</div>
@@ -141,6 +141,11 @@ html = """
       <input id="scrub" type="range" min="0" max="1000" value="0" step="1" />
     </div>
 
+    <div class="toggle">
+      <input id="follow" type="checkbox" checked />
+      <div class="small">Follow marker (camera)</div>
+    </div>
+
     <div class="row" style="justify-content:space-between;">
       <div class="small mono" id="timeVal"></div>
       <div class="small mono" id="posVal"></div>
@@ -149,50 +154,73 @@ html = """
 
 <script>
   const DATA = __PAYLOAD_JSON__;
+  const coords = DATA.coords;      // [ [lon,lat], ... ]
+  const times  = DATA.times;       // seconds_elapsed
+  const bears  = DATA.bearings;    // bearing per point
 
-  const coords = DATA.coords;     // [ [lon,lat], ... ]
-  const times  = DATA.times;      // seconds_elapsed
-  const bears  = DATA.bearings;   // bearing per point
+  function lerp(a,b,t){ return a+(b-a)*t; }
 
-  function lerp(a,b,t) { return a + (b-a)*t; }
-
-  function findSegmentIndex(t) {
-    if (t <= times[0]) return 0;
-    if (t >= times[times.length-1]) return times.length-2;
-
-    let lo = 0, hi = times.length - 1;
-    while (hi - lo > 1) {
-      const mid = (lo + hi) >> 1;
-      if (times[mid] <= t) lo = mid; else hi = mid;
+  function findSegmentIndex(t){
+    if(t <= times[0]) return 0;
+    if(t >= times[times.length-1]) return times.length-2;
+    let lo=0, hi=times.length-1;
+    while(hi-lo>1){
+      const mid=(lo+hi)>>1;
+      if(times[mid] <= t) lo=mid; else hi=mid;
     }
     return lo;
   }
 
-  function interpState(t) {
+  function interpState(t){
     const i = findSegmentIndex(t);
-    const t0 = times[i], t1 = times[i+1];
-    const p0 = coords[i], p1 = coords[i+1];
-    const b0 = (bears[i] ?? 0), b1 = (bears[i+1] ?? b0);
-
-    const u = (t1 === t0) ? 0 : (t - t0) / (t1 - t0);
-    const lon = lerp(p0[0], p1[0], u);
-    const lat = lerp(p0[1], p1[1], u);
-
-    let db = ((b1 - b0 + 540) % 360) - 180;
-    const bearing = (b0 + db * u + 360) % 360;
-
-    return { lon, lat, bearing, i, u };
+    const t0=times[i], t1=times[i+1];
+    const p0=coords[i], p1=coords[i+1];
+    const b0=(bears[i] ?? 0), b1=(bears[i+1] ?? b0);
+    const u = (t1===t0)?0:(t-t0)/(t1-t0);
+    const lon=lerp(p0[0], p1[0], u);
+    const lat=lerp(p0[1], p1[1], u);
+    let db = ((b1-b0+540)%360)-180;
+    const bearing=(b0 + db*u + 360) % 360;
+    return {lon, lat, bearing};
   }
+
+  // --- OSM Raster basemap style (roads + labels baked into tiles)
+  const style = {
+    "version": 8,
+    "sources": {
+      "osm": {
+        "type": "raster",
+        "tiles": [
+          "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        ],
+        "tileSize": 256,
+        "attribution": "© OpenStreetMap contributors"
+      }
+    },
+    "layers": [
+      { "id": "osm", "type": "raster", "source": "osm" }
+    ]
+  };
 
   const map = new maplibregl.Map({
     container: "map",
-    style: "https://demotiles.maplibre.org/style.json",
+    style,
     center: DATA.center,
-    zoom: 17,
-    pitch: 45,
+    zoom: 16,
+    pitch: 0,
     bearing: 0
   });
   map.addControl(new maplibregl.NavigationControl(), "top-right");
+
+  // Fit map to route bounds
+  function fitToRoute(){
+    let minLon=Infinity, minLat=Infinity, maxLon=-Infinity, maxLat=-Infinity;
+    for(const p of coords){
+      minLon=Math.min(minLon, p[0]); minLat=Math.min(minLat, p[1]);
+      maxLon=Math.max(maxLon, p[0]); maxLat=Math.max(maxLat, p[1]);
+    }
+    map.fitBounds([[minLon, minLat],[maxLon, maxLat]], { padding: 60, duration: 0 });
+  }
 
   // Marker element (arrow)
   const el = document.createElement("div");
@@ -205,23 +233,22 @@ html = """
   el.style.transformOrigin = "center";
   el.style.clipPath = "polygon(50% 0%, 100% 60%, 50% 45%, 0% 60%)";
 
-  const marker = new maplibregl.Marker({ element: el })
-    .setLngLat(coords[0])
-    .addTo(map);
+  const marker = new maplibregl.Marker({ element: el }).setLngLat(coords[0]).addTo(map);
 
-  // Route line
-  const lineGeo = {
-    type: "Feature",
-    geometry: { type: "LineString", coordinates: coords }
-  };
+  // Route line (overlay)
+  const lineGeo = { type:"Feature", geometry:{ type:"LineString", coordinates: coords } };
 
   map.on("load", () => {
-    map.addSource("route", { type: "geojson", data: lineGeo });
+    fitToRoute();
+    map.addSource("route", { type:"geojson", data: lineGeo });
     map.addLayer({
-      id: "route-line",
-      type: "line",
-      source: "route",
-      paint: { "line-width": 6, "line-opacity": 0.7 }
+      id:"route-line",
+      type:"line",
+      source:"route",
+      paint:{
+        "line-width": 5,
+        "line-opacity": 0.9
+      }
     });
   });
 
@@ -233,98 +260,81 @@ html = """
   const scrub = document.getElementById("scrub");
   const timeVal = document.getElementById("timeVal");
   const posVal = document.getElementById("posVal");
+  const followEl = document.getElementById("follow");
 
-  const tMin = DATA.tMin;
-  const tMax = DATA.tMax;
+  const tMin = DATA.tMin, tMax = DATA.tMax;
 
-  function scrubToT(s) {
-    const u = s / 1000.0;
-    return tMin + (tMax - tMin) * u;
+  function scrubToT(s){
+    const u = s/1000.0;
+    return tMin + (tMax-tMin)*u;
   }
-  function tToScrub(t) {
-    const u = (t - tMin) / (tMax - tMin);
-    return Math.max(0, Math.min(1000, Math.round(u * 1000)));
+  function tToScrub(t){
+    const u = (t-tMin)/(tMax-tMin);
+    return Math.max(0, Math.min(1000, Math.round(u*1000)));
   }
 
-  let playing = false;
-  let speed = parseFloat(speedEl.value);
-  let t = tMin;
-  let lastTs = null;
+  let playing=false;
+  let speed=parseFloat(speedEl.value);
+  let t=tMin;
+  let lastTs=null;
 
-  function updateUI(state) {
+  function updateUI(state){
     timeVal.textContent = `t=${t.toFixed(2)}s`;
     posVal.textContent = `lat=${state.lat.toFixed(6)} lon=${state.lon.toFixed(6)}`;
     speedVal.textContent = `${speed.toFixed(2)}x`;
   }
 
-  function tick(ts) {
-    if (!playing) return;
-    if (lastTs === null) lastTs = ts;
-    const dtMs = ts - lastTs;
-    lastTs = ts;
+  function tick(ts){
+    if(!playing) return;
+    if(lastTs===null) lastTs=ts;
+    const dtMs = ts-lastTs;
+    lastTs=ts;
 
-    t += (dtMs / 1000.0) * speed;
-    if (t >= tMax) {
-      t = tMax;
-      playing = false;
-    }
+    t += (dtMs/1000.0)*speed;
+    if(t>=tMax){ t=tMax; playing=false; }
 
     const state = interpState(t);
     marker.setLngLat([state.lon, state.lat]);
     el.style.transform = `rotate(${state.bearing}deg)`;
 
-    // Smooth camera follow
-    map.easeTo({
-      center: [state.lon, state.lat],
-      duration: 200,
-      easing: (x) => x
-    });
+    if(followEl.checked){
+      map.easeTo({ center:[state.lon, state.lat], duration: 180, easing:(x)=>x });
+    }
 
     scrub.value = tToScrub(t);
     updateUI(state);
-
     requestAnimationFrame(tick);
   }
 
-  btnPlay.onclick = () => {
-    if (!playing) {
-      playing = true;
-      lastTs = null;
-      requestAnimationFrame(tick);
-    }
+  btnPlay.onclick=()=>{
+    if(!playing){ playing=true; lastTs=null; requestAnimationFrame(tick); }
   };
+  btnPause.onclick=()=>{ playing=false; };
 
-  btnPause.onclick = () => {
-    playing = false;
-  };
-
-  speedEl.oninput = () => {
-    speed = parseFloat(speedEl.value);
+  speedEl.oninput=()=>{
+    speed=parseFloat(speedEl.value);
     speedVal.textContent = `${speed.toFixed(2)}x`;
   };
 
-  scrub.oninput = () => {
-    playing = false; // like Google Maps scrubbing
-    t = scrubToT(parseInt(scrub.value, 10));
+  scrub.oninput=()=>{
+    playing=false;
+    t = scrubToT(parseInt(scrub.value,10));
     const state = interpState(t);
     marker.setLngLat([state.lon, state.lat]);
     el.style.transform = `rotate(${state.bearing}deg)`;
-    map.jumpTo({ center: [state.lon, state.lat] });
+    map.jumpTo({ center:[state.lon, state.lat] });
     updateUI(state);
   };
 
-  // Initial render
-  const s0 = interpState(t);
-  updateUI(s0);
+  // Initial
+  updateUI(interpState(t));
 </script>
 </body>
 </html>
 """
 
-# Inject payload JSON safely
 html = html.replace("__PAYLOAD_JSON__", payload_json)
-
-components.html(html, height=740)
+components.html(html, height=780)
 
 with st.expander("Data preview"):
     st.dataframe(df.head(50), use_container_width=True)
