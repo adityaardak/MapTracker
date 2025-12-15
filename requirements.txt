@@ -1,8 +1,6 @@
 streamlit
-plotly
 pandas
 numpy
 folium
 streamlit-folium
-streamlit-autorefresh plotly
-
+streamlit-autorefresh
