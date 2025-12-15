@@ -1,5 +1,7 @@
-streamlit 
+streamlit
 pandas
+numpy
 folium
 streamlit-folium
-streamlit-autorefresh
+streamlit-autorefresh plotly
+
