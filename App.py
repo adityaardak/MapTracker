@@ -270,7 +270,7 @@ html = """
   </div>
 
 <script>
-  const DATA = _PAYLOAD_JSON_;
+  const DATA = __PAYLOAD_JSON__;
   const tMin = DATA.tMin, tMax = DATA.tMax;
 
   // OSM raster basemap
@@ -396,14 +396,14 @@ html = """
     for(const tr of DATA.tracks){
       const div = document.createElement("div");
       div.className = "legend-item";
-      div.innerHTML = <span class="dot" style="background:${tr.color}"></span><span class="small mono">Group ${tr.group}</span>;
+      div.innerHTML = `<span class="dot" style="background:${tr.color}"></span><span class="small mono">Group ${tr.group}</span>`;
       legendEl.appendChild(div);
     }
 
     for(const tr of DATA.tracks){
       const gid = tr.group;
-      const fullId = route_full_${gid};
-      const travId = route_trav_${gid};
+      const fullId = `route_full_${gid}`;
+      const travId = `route_trav_${gid}`;
 
       // full route source/layer
       map.addSource(fullId, {
@@ -411,7 +411,7 @@ html = """
         data:{ type:"Feature", geometry:{ type:"LineString", coordinates: tr.coords } }
       });
       map.addLayer({
-        id:layer_full_${gid},
+        id:`layer_full_${gid}`,
         type:"line",
         source:fullId,
         paint:{
@@ -427,7 +427,7 @@ html = """
         data:{ type:"Feature", geometry:{ type:"LineString", coordinates: [tr.coords[0]] } }
       });
       map.addLayer({
-        id:layer_trav_${gid},
+        id:`layer_trav_${gid}`,
         type:"line",
         source:travId,
         paint:{
@@ -453,9 +453,9 @@ html = """
   let lastTs=null;
 
   function updateUI(avg){
-    timeVal.textContent = t=${t.toFixed(2)}s;
-    posVal.textContent = avg lat=${avg.lat.toFixed(6)} lon=${avg.lon.toFixed(6)};
-    speedVal.textContent = ${speed.toFixed(2)}x;
+    timeVal.textContent = `t=${t.toFixed(2)}s`;
+    posVal.textContent = `avg lat=${avg.lat.toFixed(6)} lon=${avg.lon.toFixed(6)}`;
+    speedVal.textContent = `${speed.toFixed(2)}x`;
   }
 
   // Update traveled route less frequently for performance
@@ -475,7 +475,7 @@ html = """
     for(const m of markers){
       const state = interpState(m.track, t);
       m.marker.setLngLat([state.lon, state.lat]);
-      m.el.style.transform = rotate(${state.bearing}deg);
+      m.el.style.transform = `rotate(${state.bearing}deg)`;
 
       sumLon += state.lon; sumLat += state.lat; count++;
 
@@ -509,7 +509,7 @@ html = """
 
   speedEl.oninput=()=>{
     speed=parseFloat(speedEl.value);
-    speedVal.textContent = ${speed.toFixed(2)}x;
+    speedVal.textContent = `${speed.toFixed(2)}x`;
   };
 
   scrub.oninput=()=>{
@@ -520,7 +520,7 @@ html = """
     for(const m of markers){
       const state = interpState(m.track, t);
       m.marker.setLngLat([state.lon, state.lat]);
-      m.el.style.transform = rotate(${state.bearing}deg);
+      m.el.style.transform = `rotate(${state.bearing}deg)`;
 
       sumLon += state.lon; sumLat += state.lat; count++;
 
@@ -545,9 +545,9 @@ html = """
 </html>
 """
 
-html = html.replace("_PAYLOAD_JSON_", payload_json)
+html = html.replace("__PAYLOAD_JSON__", payload_json)
 components.html(html, height=800)
 
 st.subheader("Preview (combined data)")
-st.write("Columns needed: *group, seconds_elapsed, latitude, longitude* (bearing optional).")
+st.write("Columns needed: **group, seconds_elapsed, latitude, longitude** (bearing optional).")
 st.dataframe(df.head(50), use_container_width=True)
